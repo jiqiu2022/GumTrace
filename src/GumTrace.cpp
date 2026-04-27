@@ -5,6 +5,71 @@
 #include "GumTrace.h"
 #include "Utils.h"
 #include "FuncPrinter.h"
+#include <cstring>
+
+static void *gumtrace_thread_start_wrapper(void *arg) {
+    auto *invocation_ctx = gum_interceptor_get_current_invocation();
+    auto *hook_data = (GumTrace::ThreadStartHookData *) gum_invocation_context_get_replacement_data(invocation_ctx);
+    if (hook_data == nullptr || hook_data->original == nullptr) {
+        return nullptr;
+    }
+
+    auto self = hook_data->self;
+    auto origin = (void *(*)(void *)) hook_data->original;
+    if (self != nullptr && self->_stalker != nullptr) {
+        gum_stalker_follow_me(self->_stalker, self->_transformer, nullptr);
+    }
+
+    void *ret = origin(arg);
+
+    if (self != nullptr && self->_stalker != nullptr) {
+        gum_stalker_unfollow_me(self->_stalker);
+    }
+
+    if (self != nullptr) {
+        std::lock_guard<std::mutex> lock(self->thread_start_hook_mutex);
+        if (hook_data->active && self->interceptor != nullptr) {
+            gum_interceptor_revert(self->interceptor, (gpointer) hook_data->target);
+            gum_interceptor_flush(self->interceptor);
+            hook_data->active = false;
+            self->thread_start_hooks.erase(hook_data->target);
+            delete hook_data;
+        }
+    }
+
+    return ret;
+}
+
+static void gumtrace_once_routine_wrapper(void) {
+    auto *invocation_ctx = gum_interceptor_get_current_invocation();
+    auto *hook_data = (GumTrace::ThreadStartHookData *) gum_invocation_context_get_replacement_data(invocation_ctx);
+    if (hook_data == nullptr || hook_data->original == nullptr) {
+        return;
+    }
+
+    auto self = hook_data->self;
+    auto origin = (void (*)(void)) hook_data->original;
+    if (self != nullptr && self->_stalker != nullptr) {
+        gum_stalker_follow_me(self->_stalker, self->_transformer, nullptr);
+    }
+
+    origin();
+
+    if (self != nullptr && self->_stalker != nullptr) {
+        gum_stalker_unfollow_me(self->_stalker);
+    }
+
+    if (self != nullptr) {
+        std::lock_guard<std::mutex> lock(self->thread_start_hook_mutex);
+        if (hook_data->active && self->interceptor != nullptr) {
+            gum_interceptor_revert(self->interceptor, (gpointer) hook_data->target);
+            gum_interceptor_flush(self->interceptor);
+            hook_data->active = false;
+            self->thread_start_hooks.erase(hook_data->target);
+            delete hook_data;
+        }
+    }
+}
 
 GumTrace *GumTrace::get_instance() {
     static GumTrace instance;
@@ -17,8 +82,93 @@ GumTrace::GumTrace() {
 }
 
 GumTrace::~GumTrace() {
+    clear_thread_start_hooks();
+    if (interceptor) g_object_unref(interceptor);
     if (_stalker) g_object_unref(_stalker);
     if (_transformer) g_object_unref(_transformer);
+}
+
+void GumTrace::hook_thread_start_routine(uintptr_t start_routine_addr) {
+    if (start_routine_addr == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(thread_start_hook_mutex);
+    if (thread_start_hooks.count(start_routine_addr) > 0) {
+        return;
+    }
+
+    if (interceptor == nullptr) {
+        interceptor = gum_interceptor_obtain();
+    }
+
+    auto *hook_data = new ThreadStartHookData{
+        .self = this,
+        .target = start_routine_addr,
+        .original = nullptr,
+        .active = false,
+        .hook_type = ThreadStartHookData::THREAD_START
+    };
+    auto replace_result = gum_interceptor_replace(interceptor, (gpointer) start_routine_addr,
+                                                  (gpointer) gumtrace_thread_start_wrapper,
+                                                  hook_data, &hook_data->original);
+    if (replace_result != GUM_REPLACE_OK) {
+        delete hook_data;
+        return;
+    }
+
+    hook_data->active = true;
+    thread_start_hooks[start_routine_addr] = hook_data;
+}
+
+void GumTrace::hook_pthread_once_routine(uintptr_t once_routine_addr) {
+    if (once_routine_addr == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(thread_start_hook_mutex);
+    if (thread_start_hooks.count(once_routine_addr) > 0) {
+        return;
+    }
+
+    if (interceptor == nullptr) {
+        interceptor = gum_interceptor_obtain();
+    }
+
+    auto *hook_data = new ThreadStartHookData{
+        .self = this,
+        .target = once_routine_addr,
+        .original = nullptr,
+        .active = false,
+        .hook_type = ThreadStartHookData::ONCE_INIT_HOOK
+    };
+    auto replace_result = gum_interceptor_replace(interceptor, (gpointer) once_routine_addr,
+                                                  (gpointer) gumtrace_once_routine_wrapper,
+                                                  hook_data, &hook_data->original);
+    if (replace_result != GUM_REPLACE_OK) {
+        delete hook_data;
+        return;
+    }
+
+    hook_data->active = true;
+    thread_start_hooks[once_routine_addr] = hook_data;
+}
+
+void GumTrace::clear_thread_start_hooks() {
+    std::lock_guard<std::mutex> lock(thread_start_hook_mutex);
+    if (interceptor == nullptr) {
+        return;
+    }
+
+    for (auto &entry : thread_start_hooks) {
+        auto *hook_data = entry.second;
+        if (hook_data != nullptr && hook_data->active) {
+            gum_interceptor_revert(interceptor, (gpointer) hook_data->target);
+        }
+        delete hook_data;
+    }
+    thread_start_hooks.clear();
+    gum_interceptor_flush(interceptor);
 }
 
 #if PLATFORM_ANDROID
@@ -284,9 +434,15 @@ void GumTrace::callout_callback(GumCpuContext *cpu_context, gpointer user_data) 
 
         if (jump_addr > 0) {
             if (self->func_maps.count(jump_addr) > 0) {
+                const auto &func_name = self->func_maps[jump_addr];
+                if (strcmp(func_name.c_str(), "pthread_create") == 0) {
+                    self->hook_thread_start_routine(cpu_context->x[2]);
+                } else if (strcmp(func_name.c_str(), "pthread_once") == 0) {
+                    self->hook_pthread_once_routine(cpu_context->x[1]);
+                }
                 self->last_func_context.info_n = 0;
                 self->last_func_context.address = jump_addr;
-                self->last_func_context.name = self->func_maps[jump_addr].c_str();
+                self->last_func_context.name = func_name.c_str();
                 memcpy(&self->last_func_context.cpu_context, cpu_context, sizeof(GumCpuContext));
                 self->last_func_context.call = true;
 
@@ -417,6 +573,7 @@ void GumTrace::follow() {
 
 void GumTrace::unfollow() {
     trace_thread_id > 0 ? gum_stalker_unfollow(_stalker, trace_thread_id) : gum_stalker_unfollow_me(_stalker);
+    clear_thread_start_hooks();
 
     if (trace_file.is_open()) {
         trace_file.write(buffer, buffer_offset);

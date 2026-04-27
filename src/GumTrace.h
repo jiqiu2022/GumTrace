@@ -7,6 +7,7 @@
 
 #include "Utils.h"
 #include "CallbackContext.h"
+#include <mutex>
 
 struct REG_LIST {
     int num = 0;
@@ -65,6 +66,9 @@ public:
     const std::map<std::string, std::size_t>& get_module_by_name(const std::string &module_name);
     void follow();
     void unfollow();
+    void hook_thread_start_routine(uintptr_t start_routine_addr);
+    void hook_pthread_once_routine(uintptr_t once_routine_addr);
+    void clear_thread_start_hooks();
 
     static void callout_callback(GumCpuContext *cpu_context, gpointer user_data);
 
@@ -83,6 +87,20 @@ public:
 
     std::unordered_map<size_t, std::string> svc_func_maps;
     std::unordered_map<size_t, std::string> func_fds;
+    GumInterceptor *interceptor = nullptr;
+    std::mutex thread_start_hook_mutex;
+    struct ThreadStartHookData {
+        enum HookType {
+            THREAD_START = 0,
+            ONCE_INIT_HOOK
+        };
+        GumTrace *self;
+        uintptr_t target;
+        gpointer original;
+        bool active;
+        HookType hook_type;
+    };
+    std::unordered_map<uintptr_t, ThreadStartHookData *> thread_start_hooks;
 
     uintptr_t atomic_addr = 0;
     int atomic_width = 0;
